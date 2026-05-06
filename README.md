@@ -1,7 +1,7 @@
 <table>
   <tr>
     <td>
-      <img src="bonsai.svg" alt="bonsai" />
+      <img src="bonsai.png" alt="bonsai" />
     </td>
     <td>
       <a href="https://github.com/GuillermoEJ">
