@@ -1,39 +1,30 @@
-import os
 import re
-import subprocess
-import sys
 from pathlib import Path
 
-OUTPUT_FILE = Path("bonsai.svg")
+from PIL import Image, ImageDraw, ImageFont
+from pybonsai.options import AppConfig, RenderOptions, TreeOptions
+from pybonsai.runner import generate_tree
+
+OUTPUT_FILE = Path("bonsai.png")
 
 WIDTH = 60
 HEIGHT = 20
-FONT_SIZE = 14
-CHAR_WIDTH = 8.4
-LINE_HEIGHT = 18
-BG_COLOR = "#0d1117"
-DEFAULT_COLOR = "#c9d1d9"
+FONT_SIZE = 16
+BG_COLOR = (13, 17, 23)
+DEFAULT_COLOR = (201, 209, 217)
 
 
-def generate_raw_bonsai() -> str:
-    cmd = [
-        sys.executable, "-m", "pybonsai",
-        "-i", "-b",
-        "-x", str(WIDTH),
-        "-y", str(HEIGHT),
-    ]
-    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    result = subprocess.run(
-        cmd, check=True, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE
-    )
-    return result.stdout.decode("utf-8", errors="replace")
+def get_font():
+    try:
+        return ImageFont.truetype("consola.ttf", FONT_SIZE)
+    except OSError:
+        try:
+            return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", FONT_SIZE)
+        except OSError:
+            return ImageFont.load_default()
 
 
-def parse_ansi_to_spans(raw: str) -> list[list[tuple[str, str]]]:
-    raw = re.sub(r"\x1b\[\?[0-9]*[a-zA-Z]", "", raw)
-    raw = re.sub(r"\x1b\[[0-9]*[A-HJ-Z]", "", raw)
-    raw = re.sub(r"\x1b\[[0-9]*G", "", raw)
+def parse_ansi_to_spans(raw: str) -> list[list[tuple[str, tuple[int, int, int]]]]:
     ansi_pattern = re.compile(r"\x1b\[([0-9;]*)m")
     lines_raw = raw.split("\n")
 
@@ -53,8 +44,7 @@ def parse_ansi_to_spans(raw: str) -> list[list[tuple[str, str]]]:
             elif code.startswith("38;2;"):
                 parts = code.split(";")
                 if len(parts) == 5:
-                    r, g, b = parts[2], parts[3], parts[4]
-                    current_color = f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+                    current_color = (int(parts[2]), int(parts[3]), int(parts[4]))
             pos = match.end()
 
         if pos < len(line):
@@ -65,21 +55,14 @@ def parse_ansi_to_spans(raw: str) -> list[list[tuple[str, str]]]:
     return parsed_lines
 
 
-def filter_tree_lines(parsed_lines: list[list[tuple[str, str]]]) -> list[list[tuple[str, str]]]:
-    filtered = []
-    for spans in parsed_lines:
-        plain = "".join(text for text, _ in spans)
-        if "Saved tree to" in plain:
-            continue
-        filtered.append(spans)
-
-    while filtered and all(t.strip() == "" for t, _ in filtered[-1]):
-        filtered.pop()
-    while filtered and all(t.strip() == "" for t, _ in filtered[0]):
-        filtered.pop(0)
+def trim_lines(parsed_lines):
+    while parsed_lines and all(t.strip() == "" for t, _ in parsed_lines[-1]):
+        parsed_lines.pop()
+    while parsed_lines and all(t.strip() == "" for t, _ in parsed_lines[0]):
+        parsed_lines.pop(0)
 
     min_indent = float("inf")
-    for spans in filtered:
+    for spans in parsed_lines:
         plain = "".join(text for text, _ in spans)
         stripped = plain.lstrip(" ")
         if stripped:
@@ -89,7 +72,7 @@ def filter_tree_lines(parsed_lines: list[list[tuple[str, str]]]) -> list[list[tu
         min_indent = 0
 
     trimmed = []
-    for spans in filtered:
+    for spans in parsed_lines:
         to_strip = min_indent
         new_spans = []
         for text, color in spans:
@@ -105,46 +88,42 @@ def filter_tree_lines(parsed_lines: list[list[tuple[str, str]]]) -> list[list[tu
     return trimmed
 
 
-def escape_xml(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+def render_png(parsed_lines) -> Image.Image:
+    parsed_lines = trim_lines(parsed_lines)
+    font = get_font()
 
+    char_bbox = font.getbbox("M")
+    char_w = char_bbox[2] - char_bbox[0]
+    char_h = int((char_bbox[3] - char_bbox[1]) * 1.4)
 
-def spans_to_svg(parsed_lines: list[list[tuple[str, str]]]) -> str:
-    parsed_lines = filter_tree_lines(parsed_lines)
+    max_cols = max(sum(len(t) for t, _ in spans) for spans in parsed_lines) if parsed_lines else 0
+    img_w = max_cols * char_w + 20
+    img_h = len(parsed_lines) * char_h + 20
 
-    content_width = max(
-        sum(len(text) for text, _ in spans) for spans in parsed_lines
-    ) if parsed_lines else 0
+    img = Image.new("RGB", (img_w, img_h), BG_COLOR)
+    draw = ImageDraw.Draw(img)
 
-    svg_width = int(content_width * CHAR_WIDTH) + 20
-    svg_height = int(len(parsed_lines) * LINE_HEIGHT) + 20
-
-    parts = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" width="{svg_width}" height="{svg_height}">',
-        f'<rect width="100%" height="100%" fill="{BG_COLOR}"/>',
-        f'<text font-family="monospace" font-size="{FONT_SIZE}" xml:space="preserve">',
-    ]
-
-    for i, spans in enumerate(parsed_lines):
-        y = 10 + (i + 1) * LINE_HEIGHT
-        parts.append(f'<tspan x="10" y="{y}">')
+    for row_idx, spans in enumerate(parsed_lines):
+        x = 10
+        y = 10 + row_idx * char_h
         for text, color in spans:
-            escaped = escape_xml(text)
-            if color == DEFAULT_COLOR:
-                parts.append(escaped)
-            else:
-                parts.append(f'<tspan fill="{color}">{escaped}</tspan>')
-        parts.append("</tspan>")
+            for ch in text:
+                draw.text((x, y), ch, font=font, fill=color)
+                x += char_w
 
-    parts.append("</text></svg>")
-    return "\n".join(parts)
+    return img
 
 
 def main():
-    raw = generate_raw_bonsai()
-    parsed = parse_ansi_to_spans(raw)
-    svg = spans_to_svg(parsed)
-    OUTPUT_FILE.write_text(svg, encoding="utf-8")
+    config = AppConfig(
+        tree=TreeOptions(),
+        render=RenderOptions(width=WIDTH, height=HEIGHT, instant=True),
+    )
+    generated = generate_tree(config)
+    ansi_output = generated.to_ansi_string()
+    parsed = parse_ansi_to_spans(ansi_output)
+    img = render_png(parsed)
+    img.save(OUTPUT_FILE)
     print(f"Generated {OUTPUT_FILE}")
 
 
